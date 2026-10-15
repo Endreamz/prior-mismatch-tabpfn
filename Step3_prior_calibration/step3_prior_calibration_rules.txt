@@ -1,0 +1,160 @@
+THE PRICE-PATH PRIOR: EVERY RULE AND THE REASON FOR IT
+Step 3 (step3_prior_calibration), version 2: asymmetric volatility, calibrated on separate stocks
+====================================================================================================
+
+What the prior is: a simulator of synthetic daily stock prices. Each simulated price history
+is run through the real pipeline, so every training task has exactly the format of the real
+tasks. Values marked "calibrated" are chosen by the search in section C; the calibrated
+numbers are saved in results\pricepath_params.json after the run.
+
+
+A. THE SIMULATED STOCK
+----------------------
+
+1. Volatility level
+   Rule:   each simulated stock gets its own annual volatility, drawn log-normally around a
+           median (spread 0.35). The median is set at the end so that the simulated median
+           matches the calibration stocks' median exactly.
+   Why:    stocks differ greatly in how volatile they are. The level is the only statistic
+           that depends on it, and the model never sees it (inputs are standardised on each
+           context), so it is matched exactly rather than searched.
+
+2. Drift
+   Rule:   a small upward trend of 0.02% a day (about 5% a year). Fixed, not calibrated.
+   Why:    the typical long-run stock return. It barely matters for a volatility question.
+
+3. Volatility clustering: asymmetric GARCH(1,1)  [NEW in version 2]
+   Rule:   today's variance depends on yesterday's squared return and yesterday's variance,
+           pulled towards a moving target level (reaction alpha, persistence beta,
+           calibrated). The reaction is asymmetric: alpha x (1 + LEVERAGE) after a fall and
+           alpha x (1 - LEVERAGE) after a rise. LEVERAGE is calibrated between 0 (symmetric,
+           version 1) and 1 (no reaction to rises at all, as in GJR-GARCH).
+   Why:    calm and turbulent days cluster in real markets. The asymmetry is the leverage
+           effect: falls raise volatility more than rises of the same size. Version 1 was
+           symmetric and missed it (the in-context coefficient on distance from the 20-day
+           average was -0.31 on real stocks against -0.05 in the simulator). The average
+           reaction stays alpha, so the stability of the variance process is unchanged.
+
+4. Heavy-tailed daily moves
+   Rule:   daily shocks follow a Student-t distribution (degrees of freedom calibrated),
+           scaled to unit variance.
+   Why:    real returns have far more extreme days than a normal distribution.
+
+5. Volatility breaks
+   Rule:   breaks arrive at random (rate per year calibrated). Each lifts log-volatility by
+           a random amount (mean size calibrated, spread 0.3).
+   Why:    the regime breaks that are the subject of the paper. Frequency and size are
+           calibrated to the real onset rate of the causal break flag.
+
+6. Break fading
+   Rule:   each break's lift decays with a 98-trading-day half-life. Fixed.
+   Why:    measured directly from real breaks, not tuned.
+
+7. Onset shocks  [CHANGED in version 2]
+   Rule:   half of all breaks start with a one-day move (size calibrated, in units of that
+           day's volatility). The move is downward with probability SHOCK_DOWN (calibrated:
+           0.5, 0.75 or 1; version 1 used a fair coin), and it enters the variance recursion,
+           so a crash day raises the following days' volatility.
+   Why:    real breaks often begin with a crash day, and crash days are mostly falls.
+           Version 1 added the shock after the recursion, so it had no effect on later
+           volatility, which real crashes do.
+
+8. Sell-off drift during breaks  [NEW in version 2]
+   Rule:   while a break is active, the expected daily return falls by BREAK_DRIFT x (the
+           break's current log-volatility lift) daily volatilities (calibrated, 0 to 0.2).
+   Why:    in real markets high-volatility spells come with falling prices. This links the
+           price level to volatility, which the input "distance from the 20-day average"
+           picks up.
+
+9. Overnight gaps
+   Rule:   25% of each day's variance happens between the close and the next open, outside
+           that day's high-low range. Fixed by assumption.
+   Why:    typical for US stocks. Added in version 1 after the first realism check showed
+           the answers far too persistent.
+
+10. Day-to-day range noise
+   Rule:   each trading day's variance gets a random multiplier with mean 1 (log spread
+           calibrated).
+   Why:    news days, quiet days and uneven trading. Added for the same reason as the gaps.
+
+11. Daily high and low
+   Rule:   each trading day is simulated as 8 small random steps from the open that end
+           exactly at the close (a Brownian bridge); the high and low are the extremes.
+   Why:    the answer is built on the high-low (Parkinson) volatility, so the high and low
+           must behave as on real data.
+
+
+B. TURNING SIMULATED PRICES INTO TASKS
+--------------------------------------
+
+12. The real pipeline, copied unchanged
+   Rule:   the same 8 inputs (5 lagged returns, 10-day change, 20-day volatility, distance
+           from the 20-day average), the same answer (next 5 days' high-low volatility above
+           the last 126 days' median) and the same causal break flag.
+   Why:    the tasks are real-format tasks by construction. This is the point of the prior.
+
+13. Task layout
+   Rule:   a context of 48-126 rows (drawn per batch), a 5-row gap, 8 question rows.
+   Why:    matches the real walk-forward set-up (window 126, gap 5). Varying the length
+           makes the model robust to shorter contexts.
+
+14. Scaling
+   Rule:   inputs standardised on the context only and clipped at +/-5; a time column from
+           0 to 1 across the context and 1 for the questions.
+   Why:    exactly as on real data.
+
+15. Efficiency and safety
+   Rule:   900-day series, 8 tasks cut from each. A series whose volatility "explodes"
+           (non-finite inputs, or above 500% a year) is discarded.
+   Why:    speed, and protection against absurd simulated stocks.
+
+
+C. HOW THE SETTINGS ARE CHOSEN (CALIBRATION)
+--------------------------------------------
+
+16. Separate calibration stocks  [NEW in version 2]
+   Rule:   calibration uses only the 20 stocks in Data\stocks_calibration (full history).
+           The 20 test stocks are never used for calibration, only for the final realism
+           check; the script stops if the two folders share a stock.
+   Why:    version 1 was calibrated on the same stocks it was tested on. Separate stocks
+           make the test leak-free in assets.
+
+17. Ten real-data targets  [two NEW in version 2]
+   Rule:   tail heaviness; volatility clustering at 1, 5 and 20 days; the share of "yes"
+           answers; answer persistence; break onsets per 126 days; logistic regression AUC;
+           and, new, the leverage effect (correlation of today's return with the next 5
+           days' average absolute return) and the correlation of the distance from the
+           20-day average with the answer.
+   Why:    together they cover what decides the task: tails, clustering, breaks,
+           overlapping answers, difficulty, and now the asymmetry. None depends on the
+           volatility level. The two new targets let the data decide how much asymmetry
+           is needed.
+
+18. The score
+   Rule:   the sum of squared differences between simulated and real medians, each in units
+           of its spread across the real stocks.
+   Why:    so that no single statistic dominates.
+
+19. Four stages
+   Rule:   stage 1, 180 combinations of clustering and breaks (other settings at middle
+           values); stage 2, 60 combinations of tails, onset-shock size and range noise;
+           stage 3, 48 combinations of the asymmetry settings (LEVERAGE x SHOCK_DOWN x
+           BREAK_DRIFT) [NEW]; stage 4, one exact rescaling of the volatility level.
+   Why:    searching everything at once would be too slow. Middle values in stage 1 avoid
+           biasing it towards one end.
+
+20. Safeguards
+   Rule:   32 simulated series per combination and 40 for the final settings; combinations
+           that explode are scored as unrealistic; a warning when the best value sits at
+           the edge of the range tried; a stopping rule fixed in advance: at most one
+           extension of the grid, and its result is accepted.
+           Used once: the first run ended at the edge for breaks per year (5, highest),
+           break size (0.15, lowest) and tail degrees of freedom (4, lowest). The grid was
+           widened in those directions only (breaks per year 7.5 and 10; break size 0.05
+           and 0.1; degrees of freedom 3). Any edge that remains is reported, not extended.
+   Why:    to reduce luck, and to stop the tuning from going on indefinitely.
+
+21. Out-of-sample realism check
+   Rule:   the final simulated stocks are compared with the 20 test stocks on the same
+           statistics (the "distance to test stocks" in Table 4).
+   Why:    shows whether the prior matches stocks it was never calibrated on.
